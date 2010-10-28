@@ -12,7 +12,7 @@ use IO::Handle;
 
 use constant IAS3URLBASE => 'http://s3.us.archive.org/';
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
-use constant VERSION => '0.5';
+use constant VERSION => '0.5.1';
 
 sub splitCSV {
     my $line = shift;
@@ -111,6 +111,7 @@ sub PUT_FILE {
 # escape non-printable chars to prevent those from confusing users
 sub escapeText {
     $_[0] =~ s/[\x00-\x1f]/xsprintf('\x%02x',$&)/ge;
+    $_[0];
 }
 
 my $ias3keys;
@@ -359,7 +360,7 @@ my %colidx;
 foreach my $i (0..$#fieldnames) {
     print STDERR "Field:", $fieldnames[$i], "\n" if $verbose;
     unless ($fieldnames[$i] =~ /^([-a-zA-Z]+)(\[\d+\])?$/) {
-	die "ERROR:bad metadata name ", escapeText($fieldnames[$i]), " in column $i\n";
+	die "ERROR:bad metadata name ", escapeText($fieldnames[$i]), " in column ".($i + 1)."\n";
     }
     my $fn = $1;
     my $ix = $2;
@@ -371,7 +372,7 @@ foreach my $i (0..$#fieldnames) {
 # "file" field must exist as a column - no command line default
 exists $colidx{'file'} or die "ERROR:required column 'file' is missing\n";
 # other metadata fields may be given in a column or in command line
-foreach my $cn (('item', 'description', 'creator', 'mediatype', 'collection')) {
+foreach my $cn (('item', 'creator', 'mediatype', 'collection')) {
     unless (exists $colidx{$cn} || defined $metadefaults{$cn}) {
 	die "ERROR:'$cn' must either exist as a column, or be specified by option\n";
     }
