@@ -111,10 +111,8 @@ sub escapeText {
     $_[0] =~ s/[\x00-\x1f]/xsprintf('\x%02x',$&)/ge;
 }
 
-my $ias3keys = $ENV{ENV_AUTHKEYS()};
-unless ($ias3keys) {
-    warn "## You could set your ACCESSKEY:SECRETKEY to ", ENV_AUTHKEYS, " environment variable\n";
-}
+my $ias3keys;
+
 # controls
 my $dryrun = 0;
 my $verbose = 0;
@@ -123,10 +121,56 @@ my $metatbl = 'metadata.csv';	# CSV file having metadata for each item
 # default metadata from command line
 my %metadefaults;
 
-my $ignorePreexistingBucket = 0;
+# don't update metadata of existing items (in fact it is the default
+# behavior of IAS3. I made 'override-mode' default because it matches user's
+# expectation.)
+my $keepExistingMetadata = 0;
+# these control options are not implemented yet.
 my $keepOldVersion = 0;
 my $cascadeDelete = 0;
 my $noDerive = 0;
+
+sub readConfig {
+    my $name = shift;
+    open(CF, $name) || return;
+    print STDERR "reading configuration from $name...\n";
+    my @keys = ('', '');
+    # assumes one-parameter-per-line format of .s3cfg (s3cmd)
+    while (<CF>) {
+	next unless /^([_a-zA-Z]+)\s*=\s*(.*?)\s*$/;
+	my $param = $1;
+	my $value = $2;
+	$param eq 'access_key' and ($keys[0] = $value, next);
+	$param eq 'secret_key' and ($keys[1] = $value, next);
+    }
+    close(CF);
+    if ($keys[0] && $keys[1]) {
+	$ias3keys = join(':', @keys);
+    }
+}
+
+# IAS3 auth keys are taken from three locations
+# (from lowest to highest priority):
+# 1) {access,secret}_key parameters in $HOME/.s3cfg
+# 2) {access,secret}_key parameters in $HOME/.ias3cfg
+# 3) IAS3KEYS environment variable
+# 4) -k command line option
+
+my $home = $ENV{'HOME'};
+if ($home) {
+    $home =~ s![^/]$!$&/!;
+    readConfig($home . ".s3cfg"); # config file for s3cmd
+    readConfig($home . ".ias3cfg"); # IAS3 config file, in the same format
+}
+
+if (exists $ENV{ENV_AUTHKEYS()}) {
+    my $keys = $ENV{ENV_AUTHKEYS()};
+    unless ($keys =~ /^[A-Za-z0-9]+:[A-Za-z0-9]+$/) {
+	warn "WARNING:", ENV_AUTHKEYS, " should be in format ACCESSKEY:SECRETKEY (ignored)\n";
+    } else {
+	$ias3keys = $keys;
+    }
+}
 
 GetOptions('n'=>\$dryrun,
 	   'v'=>\$verbose,
@@ -139,7 +183,7 @@ GetOptions('n'=>\$dryrun,
 	   'dc=s'=>\$metadefaults{'creator'},
 	   'dm=s'=>\$metadefaults{'mediatype'},
 	   # control options
-	   'ignore-preexisting-bucket'=>\$ignorePreexistingBucket,
+	   'keep-existing-metadata'=>\$keepExistingMetadata,
 	   # not yet supported control options
 	   'keep-old'=>\$keepOldVersion,
 	   'cascade-delete'=>\$cascadeDelete,
@@ -310,7 +354,7 @@ while (<MT>) {
 	}
     }
 
-    if ($ignorePreexistingBucket) {
+    unless ($keepExistingMetadata) {
 	push(@headers, 'x-archive-ignore-preexisting-bucket', '1');
     }
     
