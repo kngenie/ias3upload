@@ -14,6 +14,14 @@ use constant IAS3URLBASE => 'http://s3.us.archive.org/';
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
 use constant VERSION => '0.6.1';
 
+sub resolvePath {
+    my $rpath = shift;
+    my $base = shift;
+    # it seems I can't simply say File::Spec->rel2abs($rpath, $base).
+    # File::Spec->rel2abs() requires directly as second argument.
+    my $dir = File::Spec->catpath((File::Spec->splitpath($base))[0, 1]);
+    return File::Spec->rel2abs($rpath, $dir);
+}
 sub splitCSV {
     my $line = shift;
     # chomp does not work well with CSV saved as "Windows CSV" on Mac.
@@ -472,10 +480,8 @@ while (<MT>) {
     # metadata for the item, no file to upload
     my $file = (exists $colidx{'file'}) && $fields[$colidx{'file'}];
     if ($file) {
-	# file field designate a file relative to metatbl. It seems I can't
-	# simply say $path = File::Spec->rel2abs("file, $metatbl)...
-	my $metatbldir = File::Spec->catpath((File::Spec->splitpath($metatbl))[0,1]);
-	my $path = File::Spec->rel2abs($file, $metatbldir);
+	# file field designate a file relative to metatbl.
+	my $path = resolvePath($file, $metatbl);
 	# filename is used as the name of uploaded file (last component of URL)
 	# XXX: currently ignores directory part - when multiple files in an item
 	# have the same filename, last one clobbers previous ones.
@@ -496,8 +502,8 @@ while (<MT>) {
 	unless (@st) {
 	    die "stat failed on $path: $!\n";
 	}
-	push(@{$task->{files}}, { path=>$path, filename=>$filename,
-				  item=>$item, size=>$st[7] });
+	push(@{$task->{files}}, { file=>$file, path=>$path, filename=>$filename,
+				  item=>$item, size=>$st[7], mtime=>$st[9] });
     }
 
     # add metadata to item. As currently only items get metadata, it's simple.
@@ -539,20 +545,59 @@ close(MT);
 foreach my $file (@{$task->{files}}) {
     $file->{item}{size} += $file->{size};
 }    
-    
+
+# read journal file left by previous upload
+my $journalFile = resolvePath('ias3upload.jnl', $metatbl);
+if (open(my $rjnl, '<', $journalFile)) {
+    my %fileidx;
+    foreach my $f (@{$task->{files}}) {
+	$fileidx{$f->{file}} = $f;
+    }
+    while (<$rjnl>) {
+	chomp;
+	if (/^U (.*)/) {
+	    my ($file, $mtime, $itemName, $filename) = split(/\s+/, $1);
+	    if (exists $fileidx{$file}) {
+		$fileidx{$file}->{uploaded} = {
+		    mtime => $mtime,
+		    itemName => $itemName,
+		    filename => $filename
+		};
+	    }
+	}
+    }
+    close($rjnl);
+}
+# then open journal file for writing.
+open(my $jnl, '>>', $journalFile) or
+    die "cannot create a journal file: $journalFile:$!\n";
+
 # now start actual upload tasks, doing some optimization.
 # - items with no file to upload are not created
 # - item creation is always combined with the first file upload
 my @uploadQueue = @{$task->{files}};
 while (@uploadQueue) {
     my $file = shift @uploadQueue;
+    if ($file->{uploaded}) {
+	my $last = $file->{uploaded};
+	# this file was uploaded in previous run. re-upload it only when
+	# something has changed.
+	if ($file->{mtime} <= $last->{mtime} &&
+	    $file->{item}{name} eq $last->{itemName} &&
+	    $file->{filename} eq $last->{filename}) {
+	    warn "skipping previously uploaded file: ", $file->{file}, "\n";
+	    next;
+	}
+    }
     my $waitUntil = $file->{waitUntil};
     if (defined $waitUntil) {
 	my $sec = $waitUntil - time();
-	if ($sec > 0) {
-	    print STDERR "holding off $sec second(s)...";
-	    sleep($sec);
-	}
+	while ($sec > 0) {
+	    print STDERR "holding off $sec second", ($sec > 1 ? 's' : ''), "...   ";
+	    sleep(1);
+	    $sec--;
+	} continue { print STDERR "\r"; }
+	print STDERR "\n";
 	delete $file->{waitUntil};
     }
     # ok, ready to go
@@ -614,6 +659,10 @@ while (@uploadQueue) {
 	print STDERR "\n";
 	if ($res->is_success) {
 	    print $res->status_line, "\n", $res->content, "\n";
+	    $res->headers->scan(sub { print "$_[0]: $_[1]\n"; });
+	    printf($jnl "U %s %s %s %s\n",
+		   $file->{file}, $file->{mtime}, $file->{item}{name},
+		   $file->{filename});
 	} else {
 	    print $res->status_line, "\n", $res->content, "\n";
 	    if (++$file->{failCount} < 5) {
@@ -628,3 +677,5 @@ while (@uploadQueue) {
     
     $item->{created} = 1;
 }
+
+close($jnl);
