@@ -12,7 +12,7 @@ use IO::Handle;
 
 use constant IAS3URLBASE => 'http://s3.us.archive.org/';
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
-use constant VERSION => '0.4';
+use constant VERSION => '0.5';
 
 sub splitCSV {
     my $line = shift;
