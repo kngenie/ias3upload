@@ -166,15 +166,15 @@ sub initConfig {
 	require Term::ReadKey;
 	my ($username, $password);
 	{
-	    print "\nEnter your Library Card username: ";
+	    print "\nEnter your Internet Archive account email address: ";
 	    Term::ReadKey::ReadMode(1);
 	    chomp($username = <STDIN>);
 	    Term::ReadKey::ReadMode(2);
-	    print "Password: ";
+	    print "Enter password (you'll not see your keystrokes): ";
 	    chomp($password = <STDIN>);
 	    Term::ReadKey::ReadMode(0);
 	    ($accessKey, $secretKey) = getKeysFromWeb($username, $password);
-	    redo if $accessKey == 'login failed';
+	    redo if $accessKey eq 'login failed';
 	}
     }
     unless ($accessKey && $secretKey) {
