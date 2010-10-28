@@ -359,8 +359,8 @@ my @fieldnames = splitCSV($specline);
 my %colidx;
 foreach my $i (0..$#fieldnames) {
     print STDERR "Field:", $fieldnames[$i], "\n" if $verbose;
-    unless ($fieldnames[$i] =~ /^([-a-zA-Z]+)(\[\d+\])?$/) {
-	die "ERROR:bad metadata name ", escapeText($fieldnames[$i]), " in column ".($i + 1)."\n";
+    unless ($fieldnames[$i] =~ /^([-a-zA-Z_]+)(\[\d+\])?$/) {
+	die "ERROR:bad metadata name '", escapeText($fieldnames[$i]), "' in column ".($i + 1)."\n";
     }
     my $fn = $1;
     my $ix = $2;
@@ -476,6 +476,9 @@ while (<MT>) {
     # we use basic form. Special metadta collection is also handled by
     # this logic.
     while (my ($h, $v) = each %headers) {
+	# Since RFC822 disallow '-' in header names, IAS3 translates
+	# '--' to '_'. Need to do that 'escaping' here.
+	$h =~ s/_/--/g;
 	if (ref $v eq 'ARRAY') {
 	    if ($#{$v} == 0) {
 		# if there's only one value, we don't use indexed form
