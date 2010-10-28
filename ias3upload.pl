@@ -12,7 +12,7 @@ use IO::Handle;
 
 use constant IAS3URLBASE => 'http://s3.us.archive.org/';
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
-use constant VERSION => '0.5.1';
+use constant VERSION => '0.6.0';
 
 sub splitCSV {
     my $line = shift;
@@ -75,6 +75,7 @@ sub PUT_FILE {
     if (defined $file) {
 	my @st = stat($file) or die "can't stat $file:\n";
 	my $size = $st[7];
+	my $blocksize = $st[11] || 4096; # just in case it's zero...
 	push(@headers, 'content-length', $size);
 	# should we set content-type as well? probably CMS doesn't care.
 	
@@ -89,7 +90,7 @@ sub PUT_FILE {
 	    }
 	    # reading file in 2048 byte chunks.
 	    my $buf;
-	    my $n = read($fh, $buf, 2048, 0);
+	    my $n = read($fh, $buf, $blocksize, 0);
 	    if ($n == 0) {
 		close($fh);
 	    } else {
@@ -276,6 +277,24 @@ sub readConfig {
     }
 }
 
+sub metadataHeaders {
+    my ($h, $v) = @_;
+    # Since RFC822 disallow '-' in header names, IAS3 translates
+    # '--' to '_'. Need to leverage that 'escaping' here (nothing difficult)
+    $h =~ s/_/--/g;
+    if (ref $v eq 'ARRAY') {
+	if ($#{$v} == 0) {
+	    # if there's only one value, we don't use indexed form
+	    return ('x-archive-meta-' . $h, $v->[0]);
+	} else {
+	    my $i = 1;
+	    return map((sprintf('x-archive-meta%02d-%s', $i++, $h), $_),
+		       @$v);
+	}
+    } else {
+	return ('x-archive-meta-' . $h, $v);
+    }
+}
 # IAS3 auth keys are taken from three locations
 # (from lowest to highest priority):
 # 1) {access,secret}_key parameters in $HOME/.s3cfg
@@ -358,7 +377,9 @@ if ($specline =~ /\r[^\n]/) {
 my @fieldnames = splitCSV($specline);
 my %colidx;
 foreach my $i (0..$#fieldnames) {
-    print STDERR "Field:", $fieldnames[$i], "\n" if $verbose;
+    print STDERR "Field[", $i + 1, "]:", $fieldnames[$i], "\n" if $verbose;
+    # just ignore empty metadata name cell without complaining
+    next if $fieldnames[$i] eq '';
     unless ($fieldnames[$i] =~ /^([-a-zA-Z_]+)(\[\d+\])?$/) {
 	die "ERROR:bad metadata name '", escapeText($fieldnames[$i]), "' in column ".($i + 1)."\n";
     }
@@ -391,25 +412,109 @@ $ua->timeout(20);
 $ua->env_proxy;
 
 $ua->default_headers->push_header('authorization'=>"LOW $ias3keys");
-$ua->default_headers->push_header('x-amz-auto-make-bucket'=>'1');
+#$ua->default_headers->push_header('x-amz-auto-make-bucket'=>'1');
 
-my $curCollection;
+my $curCollections;
 my $curItem;
-# read on the metatbl file...
-# TODO: probably we should scan entire metatbl first to get rough idea of
-# how big each item would be. It would allow us to give 'size-hint' header
-# to IA CMS.
+# read on rest of the metatbl file... we first read entire metatbl file
+# to construct a list of tasks to be performed (TODO merge in information
+# from jornal of previous upload for retry/update). Verify information to
+# report any errors before starting actual upload work.
+my $task = {
+    collections => {},
+    items => {},
+    files => []
+};
+# collections named in command-line become initial $curCollections
+if ($metadefaults{'collection'}) {
+    # note $metadefaults{'collection'} is an array if defined
+    my @cols = map({ name => $metadefaults{'collection'},
+		     items => [] }, @{$metadefaults{'collection'}});
+    for my $col (@cols) {
+	$task->{collections}{$col->{name}} = $col;
+    }
+    $curCollections = \@cols;
+}
+# similarly for $curItem
+if ($metadefaults{'item'}) {
+    $curItem = { name => $metadefaults{'item'},
+		 metadata => {},
+		 files => [] };
+    $task->{items}{$curItem->{name}} = $curItem;
+}
+
+# read body rows
 while (<MT>) {
     my @fields = splitCSV($_);
-    my %headers;
+    my @collections;
+    if (exists $colidx{'collection'}) {
+	@collections = map {
+	    $task->{collections}{$_} ||= { name=>$_, items=>[] };
+	} grep($_, @fields[@{$colidx{'collection'}}]);
+    }
+    # $curCollections carries over only when 'collection' columns are all empty
+    @collections or (@collections = @$curCollections);
+    unless (@collections) {
+	die "ERROR:collection is unknown at $metatbl:$.";
+    }
+
+    my $itemName = (exists $colidx{'item'}) && $fields[$colidx{'item'}]
+	|| $curItem->{name};
+    unless ($itemName) {
+	die "item identifier is unknown at $metatbl:$.\n";
+    }
+    my $item = ($task->{items}{$itemName}
+		||= { name=>$itemName, metadata=>{}, files=>[] });
+    
+    $item->{collections} = \@collections;
+
+    # allow for a row without "file" (i.e. empty), which just specifies
+    # metadata for the item, no file to upload
+    my $file = (exists $colidx{'file'}) && $fields[$colidx{'file'}];
+    if ($file) {
+	# file field designate a file relative to metatbl. It seems I can't
+	# simply say $path = File::Spec->rel2abs("file, $metatbl)...
+	my $metatbldir = File::Spec->catpath((File::Spec->splitpath($metatbl))[0,1]);
+	my $path = File::Spec->rel2abs($file, $metatbldir);
+	# filename is used as the name of uploaded file (last component of URL)
+	# XXX: currently ignores directory part - when multiple files in an item
+	# have the same filename, last one clobbers previous ones.
+	# @pathcomps = (volume, directory, filename)
+	my @pathcomps = File::Spec->splitpath($file);
+	my $filename = $pathcomps[2];
+	# do some sanity check on the file now.
+	unless (-e $path) {
+	    die "$path: file does not exist\n";
+	}
+	unless (-f _) {
+	    die "$path: not a plain file\n";
+	}
+	unless (-r _) {
+	    die "file $path is not readable\n";
+	}
+	my @st = stat(_);
+	unless (@st) {
+	    die "stat failed on $path: $!\n";
+	}
+	push(@{$task->{files}}, { path=>$path, filename=>$filename,
+				  item=>$item, size=>$st[7] });
+    }
+
+    # add metadata to item. As currently only items get metadata, it's simple.
+    # it will become confusing when backend start accepting metadata for
+    # files -- which we should apply metadata, file or item, for rows where
+    # they are created at once?
     foreach my $i (0..$#fields) {
+	# $fieldnames[$i] is 'undefined' for empty header, but $fn will be
+	# empty string, not 'undefined'.
 	my $fn = $fieldnames[$i];
-	if (!defined($fn) && $fields[$i] ne '') {
+	if ($fn eq '' && $fields[$i] ne '') {
 	    warn "WARNING:$metatbl:$.:",
-	    "a value found in column $i without metadata name (ignored)\n";
+	    "a value found in column ", $i + 1, ", which has no metadata name ",
+	    "(ignored)\n";
 	    next;
 	}
-	# these fields requires special handling
+	# these fields are special and already handled above
 	next if $fn =~ /^file|item|collection$/;
 	# other fields are plain metadata (X-Archive-Meta-* headers)
 	# note that index ([\d+] after column name) doesn't matter at all
@@ -417,87 +522,75 @@ while (<MT>) {
 	# (also metadata index would be different from those user specified in
 	# metadata.csv). we'd need to change this behavior if users want to
 	# enforce order with indexes.
-	push(@{$headers{$fn}}, $fields[$i])
+	push(@{$item->{metadata}{$fn}}, $fields[$i])
 	    if $fields[$i] ne '';
     }
-    # request URI
-    my $uri;
-    # content (actually name of a file containing it) to be sent
-    my $content;
+		
+    # use item identifier as title if unspecified
+    $item->{'title'} ||= $item->{name};
 
-    my $collection = (exists $colidx{'collection'}
-		      && [grep($_, @fields[@{$colidx{'collection'}}])]);
-    # $curCollection is used only when all 'collection' columns are empty.
-    if (!$collection || $#{$collection} == -1) {
-	$collection = $curCollection || $metadefaults{'collection'};
-    }
-    unless ($collection && $#{$collection} >= 0) {
-	die "collection is unknown at ";
-    }
-    $headers{'collection'} = $collection;
+    $curItem = $item;
+    $curCollections = \@collections;
 
-    my $item = (exists $colidx{'item'} && $fields[$colidx{'item'}])
-	|| $curItem || $metadefaults{'item'};
-    unless ($item) {
-	die "item is unknown at ";
-    }
-    unless ($headers{'title'}) {
-	$headers{'title'} = [$item];
-    }
+}
+close(MT);
 
-    # probably I should allow for a row without "file", which just specifies
-    # metadata for the item.
-    my $file = $fields[$colidx{'file'}];
-    if ($file) {
-	# file field is relative to metatbl. It seems I can't simply say
-	# $path = File::Spec->rel2abs($file, $metatbl);
-	my $metatbldir = File::Spec->catpath((File::Spec->splitpath($metatbl))[0,1]);
-	my $path = File::Spec->rel2abs($file, $metatbldir);
-	# filename is used as the name of uploaded file (last component of URL)
-	# XXX: currently ignores directory part - when multiple files within an item
-	# have the same filename, last one clobbers previous ones.
-	# @pathcomps = (volume, directory, filename)
-	my @pathcomps = File::Spec->splitpath($file);
-	my $filename = $pathcomps[2];
-	$uri = IAS3URLBASE."$item/$filename";
-	$content = $path;
-	print STDERR "Uploading $path\n";
-    } else {
-	# creating an item
-	$uri = IAS3URLBASE.$item;
-	# leave $content undef
+# calculate total upload size for each item, for size-hint
+foreach my $file (@{$task->{files}}) {
+    $file->{item}{size} += $file->{size};
+}    
+    
+# now start actual upload tasks, doing some optimization.
+# - items with no file to upload are not created
+# - item creation is always combined with the first file upload
+my @uploadQueue = @{$task->{files}};
+while (@uploadQueue) {
+    my $file = shift @uploadQueue;
+    my $waitUntil = $file->{waitUntil};
+    if (defined $waitUntil) {
+	my $sec = $waitUntil - time();
+	if ($sec > 0) {
+	    print STDERR "holding off $sec second(s)...";
+	    sleep($sec);
+	}
+	delete $file->{waitUntil};
     }
-
+    # ok, ready to go
     my @headers = ();
-    # As metadata (most often 'collection' and 'subject') may have multiple
-    # values, %headers has an array for each metadata name (in some case,
-    # notably 'title' may be a scalar). If there in fact multiple values,
-    # we use metadata header in indexed form. If there's only one value,
-    # we use basic form. Special metadta collection is also handled by
-    # this logic.
-    while (my ($h, $v) = each %headers) {
-	# Since RFC822 disallow '-' in header names, IAS3 translates
-	# '--' to '_'. Need to do that 'escaping' here.
-	$h =~ s/_/--/g;
-	if (ref $v eq 'ARRAY') {
-	    if ($#{$v} == 0) {
-		# if there's only one value, we don't use indexed form
-		push(@headers, 'x-archive-meta-' . $h, $v->[0]);
-	    } else {
-		foreach my $i (0..$#{$v}) {
-		    push(@headers,
-			 sprintf('x-archive-meta%02d-%s', $i + 1, $h),
-			 $v->[$i]);
-		}
-	    }
-	} else {
-	    push(@headers, 'x-archive-meta-' . $h, $v);
+    my $item = $file->{item};
+    # prepare item metadata if the item hasn't been created yet (in this
+    # session) - it might exist on the server.
+    unless ($item->{created}) {
+	my $metadata = $item->{metadata};
+
+	# prepare actual HTTP headers for metadata
+	push(@headers, 'x-amz-auto-make-bucket', 1);
+	# As metadata (most often 'collection' and 'subject') may have multiple
+	# values, %metadata has an array for each metadata name (in come case,
+	# notably 'title', may be a scalar). If there in fact multiple values,
+	# we use metadata header in indexed form. If there's only one value
+	# (either in an array or as a scalar), we use basic form. Special metadata
+	# 'collection' is also handled by this same logic.
+	while (my ($h, $v) = each %$metadata) {
+	    push(@headers, metadataHeaders($h, $v));
+	}
+	# add metadata headers for collections item gets associated with
+	my @collectionNames = map($_->{name}, @{$item->{collections}});
+	push(@headers, metadataHeaders('collection', \@collectionNames));
+
+	# overwrite existing bucket unless user explicitly told not to.
+	unless ($keepExistingMetadata) {
+	    push(@headers, 'x-archive-ignore-preexisting-bucket', '1');
+	}
+
+	# size-hint
+	if ($item->{size}) {
+	    push(@headers, 'x-archive-size-hint', $item->{size});
 	}
     }
 
-    unless ($keepExistingMetadata) {
-	push(@headers, 'x-archive-ignore-preexisting-bucket', '1');
-    }
+    my $uri = IAS3URLBASE . $item->{name} . "/" . $file->{filename};
+    my $content = $file->{path};
     
     if ($verbose) {
 	print STDERR "PUT $uri\n";
@@ -505,6 +598,7 @@ while (<MT>) {
 	    print STDERR $headers[$i], ":", $headers[$i + 1], "\n";
 	}
     }
+
     if ($dryrun) {
 	print STDERR "## dry-run; not making actual request\n";
     } else {
@@ -518,11 +612,15 @@ while (<MT>) {
 	    print $res->status_line, "\n", $res->content, "\n";
 	} else {
 	    print $res->status_line, "\n", $res->content, "\n";
-	    # TODO: record failures and prepare for retry
+	    if (++$file->{failCount} < 5) {
+		$file->{waitUntil} = time() + 120;
+		push(@uploadQueue, $file);
+	    } else {
+		# give up
+	    }
+	    next;
 	}
     }
-    $curCollection = $collection;
-    $curItem = $item;
+    
+    $item->{created} = 1;
 }
-close(MT);
-# TODO show some statistics
