@@ -106,6 +106,11 @@ sub PUT_FILE {
     }
 }
 
+# escape non-printable chars to prevent those from confusing users
+sub escapeText {
+    $_[0] =~ s/[\x00-\x1f]/xsprintf('\x%02x',$&)/ge;
+}
+
 my $ias3keys = $ENV{ENV_AUTHKEYS()};
 unless ($ias3keys) {
     warn "## You could set your ACCESSKEY:SECRETKEY to ", ENV_AUTHKEYS, " environment variable\n";
@@ -129,14 +134,16 @@ GetOptions('n'=>\$dryrun,
 	   'k=s'=>\$ias3keys,
 	   'c=s'=>\$metadefaults{'collection'},
 	   'i=s'=>\$metadefaults{'item'},
+	   # not yet supported metadata default options
 	   'dd=s'=>\$metadefaults{'description'},
 	   'dc=s'=>\$metadefaults{'creator'},
 	   'dm=s'=>\$metadefaults{'mediatype'},
+	   # control options
+	   'ignore-preexisting-bucket'=>\$ignorePreexistingBucket,
 	   # not yet supported control options
 	   'keep-old'=>\$keepOldVersion,
 	   'cascade-delete'=>\$cascadeDelete,
 	   'no-derive'=>\$noDerive,
-	   'ignore-preexisting-bucket'=>\$ignorePreexistingBucket,
     );
 
 unless (defined $ias3keys) {
@@ -147,21 +154,38 @@ unless (defined $ias3keys) {
 unless ($ias3keys =~ /^[A-Za-z0-9]+:[A-Za-z0-9]+$/) {
     die "ERROR:keys must be in format ACCESSKEY:SECRETKEY\n";
 }
+# process multi-valued metadata defaults
+foreach my $m (('collection')) {
+    if (defined $metadefaults{$m}) {
+	my @values = split(/\s*,\s*/, $metadefaults{$m});
+	$metadefaults{$m} = \@values;
+    }
+}
 
 # metatbl is kept open until the end of all uploads.
 unless (open(MT, $metatbl)) {
     die "cannot open $metatbl: $!\n";
 }
 my $specline = <MT>;
+# if $specline has CR in the middle, it is very likely CSV is saved in
+# Mac format. start over with EOL set to CR.
+if ($specline =~ /\r[^\n]/) {
+    seek(MT, 0, 0) || die "ERROR:seek on $metatbl failed\n";
+    $/ = "\r";
+    $specline = <MT>;
+}
 my @fieldnames = splitCSV($specline);
 my %colidx;
 foreach my $i (0..$#fieldnames) {
     print STDERR "Field:", $fieldnames[$i], "\n" if $verbose;
-    unless ($fieldnames[$i] =~ /^[-a-zA-Z]+$/) {
-	die "ERROR:bad metadata name ", $fieldnames[$i], " in column $i\n";
+    unless ($fieldnames[$i] =~ /^([-a-zA-Z]+)(\[\d+\])?$/) {
+	die "ERROR:bad metadata name ", escapeText($fieldnames[$i]), " in column $i\n";
     }
-    $fieldnames[$i] = lc($fieldnames[$i]);
-    $colidx{$fieldnames[$i]} = $i;
+    my $fn = $1;
+    my $ix = $2;
+    # index part is unused for now and simply discarded
+    $fieldnames[$i] = $fn;
+    push(@{$colidx{$fn}}, $i);
 }
 # some must-have fields
 # "file" field must exist as a column - no command line default
@@ -171,6 +195,13 @@ foreach my $cn (('item', 'description', 'creator', 'mediatype', 'collection')) {
     unless (exists $colidx{$cn} || defined $metadefaults{$cn}) {
 	die "ERROR:'$cn' must either exist as a column, or be specified by option\n";
     }
+}
+# check for columns that can appear only once
+foreach my $cn (('item', 'file', 'mediatype')) {
+    if (exists $colidx{$cn} && $#{$colidx{$cn}} > 0) {
+	die "ERROR:sorry, you can't have $cn in more than one column\n";
+    }
+    $colidx{$cn} = $colidx{$cn}->[0];
 }
 
 my $ua = LWP::UserAgent->new();
@@ -191,11 +222,20 @@ while (<MT>) {
     my %headers;
     foreach my $i (0..$#fields) {
 	my $fn = $fieldnames[$i];
+	if (!defined($fn) && $fields[$i] ne '') {
+	    warn "WARNING:$metatbl:$.:",
+	    "a value found in column $i without metadata name (ignored)\n";
+	    next;
+	}
 	# these fields requires special handling
 	next if $fn =~ /^file|item|collection$/;
-	# other fields are plain metadata
-	# X-Archive-Meta-*
-	$headers{$fn} = $fields[$i]
+	# other fields are plain metadata (X-Archive-Meta-* headers)
+	# note that index ([\d+] after column name) doesn't matter at all
+	# and multiple metadata are sent in the order they appear in a row
+	# (also metadata index would be different from those user specified in
+	# metadata.csv). we'd need to change this behavior if users want to
+	# enforce order with indexes.
+	push(@{$headers{$fn}}, $fields[$i])
 	    if $fields[$i] ne '';
     }
     # request URI
@@ -204,11 +244,15 @@ while (<MT>) {
     my $content;
 
     my $collection = (exists $colidx{'collection'}
-		      && $fields[$colidx{'collection'}])
-	|| $curCollection || $metadefaults{'collection'};
-    unless ($collection) {
+		      && [grep($_, @fields[@{$colidx{'collection'}}])]);
+    # $curCollection is used only when all 'collection' columns are empty.
+    if (!$collection || $#{$collection} == -1) {
+	$collection = $curCollection || $metadefaults{'collection'};
+    }
+    unless ($collection && $#{$collection} >= 0) {
 	die "collection is unknown at ";
     }
+    $headers{'collection'} = $collection;
 
     my $item = (exists $colidx{'item'} && $fields[$colidx{'item'}])
 	|| $curItem || $metadefaults{'item'};
@@ -216,7 +260,7 @@ while (<MT>) {
 	die "item is unknown at ";
     }
     unless ($headers{'title'}) {
-	$headers{'title'} = $item;
+	$headers{'title'} = [$item];
     }
 
     # probably I should allow for a row without "file", which just specifies
@@ -243,17 +287,23 @@ while (<MT>) {
     }
 
     my @headers = ();
-    # TODO: I guess item may be in multiple collections.
-    # space delimited multiple names in collection field?
-    # TODO: actually collection and title are not necessary when
-    # uploading a file to existing collection. Since they got simply
-    # ignored, I'm leaving them.
-    push(@headers, 'x-archive-meta01-collection', $collection);
+    # As metadata (most often 'collection' and 'subject') may have multiple
+    # values, %headers has an array for each metadata name (in some case,
+    # notably 'title' may be a scalar). If there in fact multiple values,
+    # we use metadata header in indexed form. If there's only one value,
+    # we use basic form. Special metadta collection is also handled by
+    # this logic.
     while (my ($h, $v) = each %headers) {
 	if (ref $v eq 'ARRAY') {
-	    foreach my $i (0..$#{$v}) {
-		push(@headers,
-		     sprintf('x-archive-meta%02d-%s', $i + 1, $h), $v);
+	    if ($#{$v} == 0) {
+		# if there's only one value, we don't use indexed form
+		push(@headers, 'x-archive-meta-' . $h, $v->[0]);
+	    } else {
+		foreach my $i (0..$#{$v}) {
+		    push(@headers,
+			 sprintf('x-archive-meta%02d-%s', $i + 1, $h),
+			 $v->[$i]);
+		}
 	    }
 	} else {
 	    push(@headers, 'x-archive-meta-' . $h, $v);
