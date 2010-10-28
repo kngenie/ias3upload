@@ -8,9 +8,11 @@ use LWP::UserAgent;
 #use HTTP::Request::Common;
 use Getopt::Long;
 use File::Spec;
+use IO::Handle;
 
 use constant IAS3URLBASE => 'http://s3.us.archive.org/';
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
+use constant VERSION => '0.4';
 
 sub splitCSV {
     my $line = shift;
@@ -41,7 +43,7 @@ sub splitCSV {
     return @fields;
 }
 
-# obsoleted code reading file content into string of bytes.
+# obsoleted code that reads file content into a string of bytes.
 # since this method won't work well with large files, I implemented
 # PUT_FILE below for efficient file transfer.
 sub getContent {
@@ -61,7 +63,7 @@ sub getContent {
 }
 
 # variant of HTTP::Request::Common->PUT that handles upload of large file
-# efficiently. HTTP::Request::Common->POST has such feature built-in
+# more efficiently. HTTP::Request::Common->POST has such feature built-in
 # ($DYNAMIC_FILE_UPLOAD), but PUT doesn't. So we need a code for
 # creating a custom PUT request. This also allows me to show progress of
 # upload.
@@ -114,6 +116,7 @@ sub escapeText {
 my $ias3keys;
 
 # controls
+my $initConfig = 0;
 my $dryrun = 0;
 my $verbose = 0;
 my $metatbl = 'metadata.csv';	# CSV file having metadata for each item
@@ -130,6 +133,129 @@ my $keepOldVersion = 0;
 my $cascadeDelete = 0;
 my $noDerive = 0;
 
+my $homedir = $ENV{'HOME'};
+$homedir =~ s![^/]$!$&/!;	# ensure $homedir has trailing slash
+
+sub confirm {
+    my ($prompt, $emptyRes) = @_;
+    while (1) {
+	print $prompt;
+	chomp(my $ans = <STDIN>);
+	return $emptyRes if defined $emptyRes and $ans eq '';
+	return 1 if $ans =~ /^y(|es|a|eah)$/i;
+	return 0 if $ans =~ /^n(|o|ope)$/i;
+	print "Please answer y or n\n";
+    }
+}
+
+sub initConfig {
+    $homedir || die "sorry, failed to locate your home directory\n";
+    -d $homedir || die "your home directory does not exist...?\n";
+
+    STDOUT->autoflush(1);
+    my $cfg = $homedir . ".ias3cfg";
+    my $ans;
+    warn "\nI'm going to create ~/.ias3cfg with your IAS3 keys for you.\n";
+    if (-f $cfg) {
+	unless (confirm("\nOh, you already have ~/.ias3cfg. Are you sure you want to overwrite it? (y/N):", 0)) {
+	    die "Alright, quitting.\n";
+	}
+    }
+    my ($accessKey, $secretKey);
+    if (confirm("\nI can get your keys from IA web site for you. Want to try? (y/N):", 0)) {
+	require Term::ReadKey;
+	my ($username, $password);
+	{
+	    print "\nEnter your Library Card username: ";
+	    Term::ReadKey::ReadMode(1);
+	    chomp($username = <STDIN>);
+	    Term::ReadKey::ReadMode(2);
+	    print "Password: ";
+	    chomp($password = <STDIN>);
+	    Term::ReadKey::ReadMode(0);
+	    ($accessKey, $secretKey) = getKeysFromWeb($username, $password);
+	    redo if $accessKey == 'login failed';
+	}
+    }
+    unless ($accessKey && $secretKey) {
+	print "\nPlease have your IAS3 keys ready. If you don't have them yet, ",
+	"get them from http://www.archive.org/account/s3.php.\n\n";
+	{
+	    print "Enter your IAS3 access key: ";
+	    chomp($accessKey = <STDIN>);
+	    unless (checkKey($accessKey)) {
+		print "Bad key - it should be letters and digits, length 16.\n";
+		redo;
+	    }
+	}
+	{
+	    print "Enter your IAS3 secret key: ";
+	    chomp($secretKey = <STDIN>);
+	    unless (checkKey($secretKey)) {
+		print "Bad key - it should be letters and digits, length 16.\n";
+		redo;
+	    }
+	}
+    }
+    writeConfig($cfg, $accessKey, $secretKey);
+    STDOUT->autoflush(0);
+}
+
+sub writeConfig {
+    my ($cfg, $accessKey, $secretKey) = @_;
+    STDOUT->printflush("Writing ~/.ias3cfg...");
+    unless (open(CF, '>', $cfg)) {
+	die "\noops, failed to open $cfg for writing: $!\n";
+    }
+    print CF "access_key = $accessKey\n";
+    print CF "secret_key = $secretKey\n";
+    close(CF);
+    # make sure it's only readable by the owner
+    chmod(0600, $cfg);
+    print "done.\n";
+}
+
+sub checkKey {
+    $_[0] =~ /^[[:alnum:]]{16}$/;
+}
+
+sub getKeysFromWeb {
+    my ($username, $password) = @_;
+    my $ua = LWP::UserAgent->new;
+    $ua->agent('ias3upload/' . VERSION);
+    $ua->timeout(20);
+    $ua->env_proxy;
+
+    require HTTP::Cookies;
+    $ua->cookie_jar(HTTP::Cookies->new());
+    my $res;
+    print "\nLogging in...\n";
+    $ua->get('http://www.archive.org/account/login.php');
+    $res = $ua->post('http://www.archive.org/account/login.php',
+		     { username => $username, password => $password,
+		       remember => 'CHECKED', submit => 1 });
+    my $loginpage = $res->content;
+    if ($loginpage =~ /Error: Invalid password or username/s) {
+	warn "Login failed. Please try again.\n";
+	return ('login failed');
+    }
+    warn "\nRetrieving S3 keys www.archive.org...\n";
+    $res = $ua->get('http://www.archive.org/account/s3.php');
+    if ($res->is_success) {
+	my $content = $res->content;
+	my @keys = $content =~ /Your S3 access key: ([[:alnum:]]{16}).*Your S3 secret key: ([[:alnum:]]{16})/s;
+	if (@keys) {
+	    warn "okay, found keys successfully.\n";
+	} else {
+	    warn "sorry, couldn't find keys on the page, probably due to page layout change. Please get keys manually.\n";
+	}
+	return @keys;
+    } else {
+	warn "sorry, couldn't load S3 keys page (possibly problem with network or Internet Archive server). Please get keys manually.\n";
+	return ();
+    }
+}
+    
 sub readConfig {
     my $name = shift;
     open(CF, $name) || return;
@@ -156,11 +282,9 @@ sub readConfig {
 # 3) IAS3KEYS environment variable
 # 4) -k command line option
 
-my $home = $ENV{'HOME'};
-if ($home) {
-    $home =~ s![^/]$!$&/!;
-    readConfig($home . ".s3cfg"); # config file for s3cmd
-    readConfig($home . ".ias3cfg"); # IAS3 config file, in the same format
+if ($homedir) {
+    readConfig($homedir . ".s3cfg"); # config file for s3cmd
+    readConfig($homedir . ".ias3cfg"); # IAS3 config file, in the same format
 }
 
 if (exists $ENV{ENV_AUTHKEYS()}) {
@@ -182,6 +306,7 @@ GetOptions('n'=>\$dryrun,
 	   'dd=s'=>\$metadefaults{'description'},
 	   'dc=s'=>\$metadefaults{'creator'},
 	   'dm=s'=>\$metadefaults{'mediatype'},
+	   'init'=>\$initConfig,
 	   # control options
 	   'keep-existing-metadata'=>\$keepExistingMetadata,
 	   # not yet supported control options
@@ -190,10 +315,21 @@ GetOptions('n'=>\$dryrun,
 	   'no-derive'=>\$noDerive,
     );
 
+if ($initConfig) {
+    initConfig();
+    exit(0);
+}
+
 unless (defined $ias3keys) {
     die "ERROR:".
-	"specify IAS3 key pair with -k (or ".ENV_AUTHKEYS." environment variable). ",
-	"visit http://www.archive.org/account/s3.php if you don't have it yet.\n";
+	"I need your IAS3 key pair for calling IAS3 API. ".
+	"Please supply it by one of following methods:\n\n".
+	"1) add command line option \"-k <access_key>:<secret_key>\",\n".
+	"2) set <access_key>:<secret_key> to environment variable '".ENV_AUTHKEYS."',\n".
+	"3) create a file '.ias3cfg' in your home directory with your access_key and\n".
+	"   secret_key parameters in it (run '$0 --init' to create it\n".
+	"   interactively)\n\n".
+	"You can get your IAS3 keys at http://www.archive.org/account/s3.php (login required)\n";
 }
 unless ($ias3keys =~ /^[A-Za-z0-9]+:[A-Za-z0-9]+$/) {
     die "ERROR:keys must be in format ACCESSKEY:SECRETKEY\n";
@@ -249,6 +385,7 @@ foreach my $cn (('item', 'file', 'mediatype')) {
 }
 
 my $ua = LWP::UserAgent->new();
+$ua->agent('ias3upload/' . VERSION);
 $ua->timeout(20);
 $ua->env_proxy;
 
