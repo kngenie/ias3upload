@@ -12,7 +12,7 @@ use IO::Handle;
 
 use constant IAS3URLBASE => 'http://s3.us.archive.org/';
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
-use constant VERSION => '0.6.0';
+use constant VERSION => '0.6.1';
 
 sub splitCSV {
     my $line = shift;
@@ -329,10 +329,10 @@ GetOptions('n'=>\$dryrun,
 	   'init'=>\$initConfig,
 	   # control options
 	   'keep-existing-metadata'=>\$keepExistingMetadata,
+	   'no-derive'=>\$noDerive,
 	   # not yet supported control options
 	   'keep-old'=>\$keepOldVersion,
 	   'cascade-delete'=>\$cascadeDelete,
-	   'no-derive'=>\$noDerive,
     );
 
 if ($initConfig) {
@@ -587,6 +587,10 @@ while (@uploadQueue) {
 	if ($item->{size}) {
 	    push(@headers, 'x-archive-size-hint', $item->{size});
 	}
+    }
+    # no-derive flag should go with all files
+    if ($noDerive) {
+	push(@headers, 'x-archive-queue-derive', '0');
     }
 
     my $uri = IAS3URLBASE . $item->{name} . "/" . $file->{filename};
