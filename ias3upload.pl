@@ -15,7 +15,7 @@ use IO::Handle;
 use constant IAS3URLBASE => 'http://s3.us.archive.org';
 use constant IADLURLBASE => 'http://www.archive.org/download';
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
-use constant VERSION => '0.6.1';
+use constant VERSION => '0.7.0';
 
 use constant UPLOADJOURNAL => 'ias3upload.jnl';
 
