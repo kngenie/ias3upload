@@ -6,13 +6,17 @@ use warnings;
 #use lib "$FindBin::Bin/lib";
 use LWP::UserAgent;
 #use HTTP::Request::Common;
+use HTTP::Date qw(str2time);
 use Getopt::Long;
 use File::Spec;
 use IO::Handle;
 
-use constant IAS3URLBASE => 'http://s3.us.archive.org/';
+use constant IAS3URLBASE => 'http://s3.us.archive.org';
+use constant IADLURLBASE => 'http://www.archive.org/download';
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
 use constant VERSION => '0.6.1';
+
+use constant UPLOADJOURNAL => 'ias3upload.jnl';
 
 sub resolvePath {
     my $rpath = shift;
@@ -119,7 +123,7 @@ sub PUT_FILE {
 
 # escape non-printable chars to prevent those from confusing users
 sub escapeText {
-    $_[0] =~ s/[\x00-\x1f]/xsprintf('\x%02x',$&)/ge;
+    $_[0] =~ s/[\x00-\x1f]/sprintf('\x%02x',ord($&))/ge;
     $_[0];
 }
 
@@ -127,8 +131,14 @@ my $ias3keys;
 
 # controls
 my $initConfig = 0;
+# no actual upload
 my $dryrun = 0;
+# print more info
 my $verbose = 0;
+# ignore previous upload
+my $forceupload = 0;
+# check against storage (slow)
+my $checkstore = 0;
 my $metatbl = 'metadata.csv';	# CSV file having metadata for each item
 
 # default metadata from command line
@@ -326,6 +336,8 @@ if (exists $ENV{ENV_AUTHKEYS()}) {
 
 GetOptions('n'=>\$dryrun,
 	   'v'=>\$verbose,
+	   'f'=>\$forceupload,
+	   'm'=>\$checkstore,
 	   'l=s'=>\$metatbl,
 	   'k=s'=>\$ias3keys,
 	   'c=s'=>\$metadefaults{'collection'},
@@ -374,10 +386,18 @@ foreach my $m (('collection')) {
 unless (open(MT, $metatbl)) {
     die "cannot open $metatbl: $!\n";
 }
+my $task = {
+    collections => {},
+    items => {},
+    files => []
+};
+# keep change to $/ local
+{
+local($/) = $/;    
 my $specline = <MT>;
 # if $specline has CR in the middle, it is very likely CSV is saved in
 # Mac format. start over with EOL set to CR.
-if ($specline =~ /\r[^\n]/) {
+if ($specline =~ /\r(?!\n)/) {
     seek(MT, 0, 0) || die "ERROR:seek on $metatbl failed\n";
     $/ = "\r";
     $specline = <MT>;
@@ -414,25 +434,13 @@ foreach my $cn (('item', 'file', 'mediatype')) {
     $colidx{$cn} = $colidx{$cn}->[0];
 }
 
-my $ua = LWP::UserAgent->new();
-$ua->agent('ias3upload/' . VERSION);
-$ua->timeout(20);
-$ua->env_proxy;
-
-$ua->default_headers->push_header('authorization'=>"LOW $ias3keys");
-#$ua->default_headers->push_header('x-amz-auto-make-bucket'=>'1');
-
-my $curCollections;
+my $curCollections = [];
 my $curItem;
 # read on rest of the metatbl file... we first read entire metatbl file
 # to construct a list of tasks to be performed (TODO merge in information
 # from jornal of previous upload for retry/update). Verify information to
 # report any errors before starting actual upload work.
-my $task = {
-    collections => {},
-    items => {},
-    files => []
-};
+
 # collections named in command-line become initial $curCollections
 if ($metadefaults{'collection'}) {
     # note $metadefaults{'collection'} is an array if defined
@@ -454,6 +462,8 @@ if ($metadefaults{'item'}) {
 # read body rows
 while (<MT>) {
     my @fields = splitCSV($_);
+    # skip empty row
+    next unless (grep(/\S/, @fields));
     my @collections;
     if (exists $colidx{'collection'}) {
 	@collections = map {
@@ -539,6 +549,7 @@ while (<MT>) {
     $curCollections = \@collections;
 
 }
+} # end of scope for $/
 close(MT);
 
 # calculate total upload size for each item, for size-hint
@@ -547,13 +558,13 @@ foreach my $file (@{$task->{files}}) {
 }    
 
 # read journal file left by previous upload
-my $journalFile = resolvePath('ias3upload.jnl', $metatbl);
+my $journalFile = resolvePath(UPLOADJOURNAL, $metatbl);
 if (open(my $rjnl, '<', $journalFile)) {
     my %fileidx;
     foreach my $f (@{$task->{files}}) {
 	$fileidx{$f->{file}} = $f;
     }
-    while (<$rjnl>) {
+    while ($_ = <$rjnl>) {
 	chomp;
 	if (/^U (.*)/) {
 	    my ($file, $mtime, $itemName, $filename) = split(/\s+/, $1);
@@ -568,9 +579,18 @@ if (open(my $rjnl, '<', $journalFile)) {
     }
     close($rjnl);
 }
+
+my $ua = LWP::UserAgent->new();
+$ua->agent('ias3upload/' . VERSION);
+$ua->timeout(20);
+$ua->env_proxy;
+
+$ua->default_headers->push_header('authorization'=>"LOW $ias3keys");
+#$ua->default_headers->push_header('x-amz-auto-make-bucket'=>'1');
+
 # then open journal file for writing.
 open(my $jnl, '>>', $journalFile) or
-    die "cannot create a journal file: $journalFile:$!\n";
+    die "cannot open a journal file: $journalFile:$!\n";
 
 # now start actual upload tasks, doing some optimization.
 # - items with no file to upload are not created
@@ -578,17 +598,36 @@ open(my $jnl, '>>', $journalFile) or
 my @uploadQueue = @{$task->{files}};
 while (@uploadQueue) {
     my $file = shift @uploadQueue;
-    if ($file->{uploaded}) {
+    my $uripath = "/" . $file->{item}{name} . "/" . $file->{filename};
+    warn "File: ", $file->{file}, " -> ", $uripath, "\n";
+    if (!$forceupload && $file->{uploaded}) {
 	my $last = $file->{uploaded};
 	# this file was uploaded in previous run. re-upload it only when
 	# something has changed.
 	if ($file->{mtime} <= $last->{mtime} &&
 	    $file->{item}{name} eq $last->{itemName} &&
 	    $file->{filename} eq $last->{filename}) {
-	    warn "skipping previously uploaded file: ", $file->{file}, "\n";
+	    warn "skipping - no change since last upload\n";
 	    next;
 	}
     }
+    if ($checkstore) {
+	my $dlurl = IADLURLBASE . $uripath;
+	print STDERR "checking ", $dlurl, "...\n" if $verbose;
+	my $res = $ua->head($dlurl);
+	if ($res->is_success) {
+	    # file exists - check date (of last upload) against file's mtime
+	    my $m = $res->headers->{'date'};
+	    if ($m && str2time($m) >= $file->{mtime}) {
+		warn "skipping - upload date later than file's mtime\n";
+		next;
+	    }
+	} else {
+	    # 404 or other failure - upload the file
+	    print $res->status_line, "\n";
+	}
+    }
+	
     my $waitUntil = $file->{waitUntil};
     if (defined $waitUntil) {
 	my $sec = $waitUntil - time();
@@ -601,8 +640,8 @@ while (@uploadQueue) {
 	delete $file->{waitUntil};
     }
     # ok, ready to go
-    my @headers = ();
     my $item = $file->{item};
+    my @headers = ();
     # prepare item metadata if the item hasn't been created yet (in this
     # session) - it might exist on the server.
     unless ($item->{created}) {
@@ -637,8 +676,10 @@ while (@uploadQueue) {
     if ($noDerive) {
 	push(@headers, 'x-archive-queue-derive', '0');
     }
+    # Expect header
+    push(@headers, 'expect', '100-continue');
 
-    my $uri = IAS3URLBASE . $item->{name} . "/" . $file->{filename};
+    my $uri = IAS3URLBASE . $uripath;
     my $content = $file->{path};
     
     if ($verbose) {
@@ -658,14 +699,21 @@ while (@uploadQueue) {
 	my $res = $ua->request($req);
 	print STDERR "\n";
 	if ($res->is_success) {
-	    print $res->status_line, "\n", $res->content, "\n";
-	    $res->headers->scan(sub { print "$_[0]: $_[1]\n"; });
+	    print $res->status_line, "\n";
+	    $res->headers->scan(sub { print "$_[0]: $_[1]\n"; }) if $verbose;
+	    print $res->content, "\n" if $verbose;
 	    printf($jnl "U %s %s %s %s\n",
 		   $file->{file}, $file->{mtime}, $file->{item}{name},
 		   $file->{filename});
+	    print "\n";
 	} else {
-	    print $res->status_line, "\n", $res->content, "\n";
-	    if (++$file->{failCount} < 5) {
+	    print $res->status_line, "\n", $res->content, "\n\n";
+	    if ($res->code == 503) {
+		# Service Unavailable - asking to slow down
+		$file->{waitUntil} = time() + 120;
+		# put it at the head so that it blocks transfer
+		unshift(@uploadQueue, $file);
+	    } elsif (++$file->{failCount} < 5) {
 		$file->{waitUntil} = time() + 120;
 		push(@uploadQueue, $file);
 	    } else {
