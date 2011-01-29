@@ -7,6 +7,7 @@ use warnings;
 use LWP::UserAgent;
 #use HTTP::Request::Common;
 use HTTP::Date qw(str2time);
+use URI::Escape;
 use Getopt::Long;
 use File::Spec;
 use IO::Handle;
@@ -568,6 +569,8 @@ if (open(my $rjnl, '<', $journalFile)) {
 	chomp;
 	if (/^U (.*)/) {
 	    my ($file, $mtime, $itemName, $filename) = split(/\s+/, $1);
+	    $file = uri_unescape($file);
+	    $filename = uri_unescape($filename);
 	    if (exists $fileidx{$file}) {
 		$fileidx{$file}->{uploaded} = {
 		    mtime => $mtime,
@@ -703,8 +706,9 @@ while (@uploadQueue) {
 	    $res->headers->scan(sub { print "$_[0]: $_[1]\n"; }) if $verbose;
 	    print $res->content, "\n" if $verbose;
 	    printf($jnl "U %s %s %s %s\n",
-		   $file->{file}, $file->{mtime}, $file->{item}{name},
-		   $file->{filename});
+		   uri_escape($file->{file}),
+		   $file->{mtime}, $file->{item}{name},
+		   uri_escape($file->{filename}));
 	    print "\n";
 	} else {
 	    print $res->status_line, "\n", $res->content, "\n\n";
