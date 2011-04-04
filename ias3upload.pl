@@ -15,7 +15,7 @@ use IO::Handle;
 use constant IAS3URLBASE => 'http://s3.us.archive.org';
 use constant IADLURLBASE => 'http://www.archive.org/download';
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
-use constant VERSION => '0.7.0';
+use constant VERSION => '0.7.1';
 
 use constant UPLOADJOURNAL => 'ias3upload.jnl';
 
@@ -314,6 +314,19 @@ sub metadataHeaders {
 	return ('x-archive-meta-' . $h, $v);
     }
 }
+
+# is this the last file to upload in its item?
+sub lastFile {
+    my $file = shift;
+    my $item = $file->{item};
+    my $c = 0;
+    foreach my $f (@{$item->{files}}) {
+	$c++ if $f->{upload};
+    }
+    print STDERR "$c file(s) to upload in ", $item->{name}, "\n";
+    return $c <= 1;
+}
+
 # IAS3 auth keys are taken from three locations
 # (from lowest to highest priority):
 # 1) {access,secret}_key parameters in $HOME/.s3cfg
@@ -513,8 +526,11 @@ while (<MT>) {
 	unless (@st) {
 	    die "stat failed on $path: $!\n";
 	}
-	push(@{$task->{files}}, { file=>$file, path=>$path, filename=>$filename,
-				  item=>$item, size=>$st[7], mtime=>$st[9] });
+	my $fileobj = {
+	    file=>$file, path=>$path, filename=>$filename,
+	    item=>$item, size=>$st[7], mtime=>$st[9]
+	};
+	push(@{$item->{files}}, $fileobj);
     }
 
     # add metadata to item. As currently only items get metadata, it's simple.
@@ -554,16 +570,20 @@ while (<MT>) {
 close(MT);
 
 # calculate total upload size for each item, for size-hint
-foreach my $file (@{$task->{files}}) {
-    $file->{item}{size} += $file->{size};
-}    
+foreach my $item (values %{$task->{items}}) {
+    foreach my $file (@{$item->{items}}) {
+	$item->{size} += $file->{size};
+    }
+}
 
 # read journal file left by previous upload
 my $journalFile = resolvePath(UPLOADJOURNAL, $metatbl);
 if (open(my $rjnl, '<', $journalFile)) {
     my %fileidx;
-    foreach my $f (@{$task->{files}}) {
-	$fileidx{$f->{file}} = $f;
+    foreach my $item (values %{$task->{items}}) {
+	foreach my $file (@{$item->{files}}) {
+	    $fileidx{$file->{file}} = $file;
+	}
     }
     while ($_ = <$rjnl>) {
 	chomp;
@@ -591,7 +611,45 @@ $ua->env_proxy;
 $ua->default_headers->push_header('authorization'=>"LOW $ias3keys");
 #$ua->default_headers->push_header('x-amz-auto-make-bucket'=>'1');
 
-# then open journal file for writing.
+# collect files to upload
+foreach my $item (values %{$task->{items}}) {
+    foreach my $file (@{$item->{files}}) {
+	my $uripath = "/" . $file->{item}{name} . "/" . $file->{filename};
+	if (!$forceupload) {
+	    if (my $last = $file->{uploaded}) {
+		# this file was uploaded in previous run. re-upload it only when
+		# something has changed.
+		if ($file->{mtime} <= $last->{mtime} &&
+		    $file->{item}{name} eq $last->{itemName} &&
+		    $file->{filename} eq $last->{filename}) {
+		    warn "File: ", $file->{file},
+		    ": skipping - no change since last upload\n";
+		    next;
+		}
+	    }
+	}
+	if ($checkstore) {
+	    my $dlurl = IADLURLBASE . $uripath;
+	    print STDERR "checking ", $dlurl, "...\n" if $verbose;
+	    my $res = $ua->head($dlurl);
+	    if ($res->is_success) {
+		# file exists - check date (of last upload) against file's mtime
+		my $m = $res->headers->{'date'};
+		if ($m && str2time($m) >= $file->{mtime}) {
+		    warn "skipping - upload date later than file's mtime\n";
+		    next;
+		}
+	    } else {
+		# 404 or other failure - upload the file
+		print $res->status_line, "\n";
+	    }
+	}
+	$file->{upload} = 1;
+	push(@{$task->{files}}, $file);
+    }
+}
+	    
+# then open journal file for writing (append mode).
 open(my $jnl, '>>', $journalFile) or
     die "cannot open a journal file: $journalFile:$!\n";
 
@@ -603,33 +661,6 @@ while (@uploadQueue) {
     my $file = shift @uploadQueue;
     my $uripath = "/" . $file->{item}{name} . "/" . $file->{filename};
     warn "File: ", $file->{file}, " -> ", $uripath, "\n";
-    if (!$forceupload && $file->{uploaded}) {
-	my $last = $file->{uploaded};
-	# this file was uploaded in previous run. re-upload it only when
-	# something has changed.
-	if ($file->{mtime} <= $last->{mtime} &&
-	    $file->{item}{name} eq $last->{itemName} &&
-	    $file->{filename} eq $last->{filename}) {
-	    warn "skipping - no change since last upload\n";
-	    next;
-	}
-    }
-    if ($checkstore) {
-	my $dlurl = IADLURLBASE . $uripath;
-	print STDERR "checking ", $dlurl, "...\n" if $verbose;
-	my $res = $ua->head($dlurl);
-	if ($res->is_success) {
-	    # file exists - check date (of last upload) against file's mtime
-	    my $m = $res->headers->{'date'};
-	    if ($m && str2time($m) >= $file->{mtime}) {
-		warn "skipping - upload date later than file's mtime\n";
-		next;
-	    }
-	} else {
-	    # 404 or other failure - upload the file
-	    print $res->status_line, "\n";
-	}
-    }
 	
     my $waitUntil = $file->{waitUntil};
     if (defined $waitUntil) {
@@ -675,8 +706,11 @@ while (@uploadQueue) {
 	    push(@headers, 'x-archive-size-hint', $item->{size});
 	}
     }
+    # to reduce the workload on IA catalogue system,
+    # all file upload should have no-derive but the last one. if no-derive
+    # is specified, it goes with the last one, too.
     # no-derive flag should go with all files
-    if ($noDerive) {
+    if ($noDerive || !lastFile($file)) {
 	push(@headers, 'x-archive-queue-derive', '0');
     }
     # Expect header
@@ -694,6 +728,7 @@ while (@uploadQueue) {
 
     if ($dryrun) {
 	print STDERR "## dry-run; not making actual request\n";
+	$file->{upload} = 0;
     } else {
 	# use of custom PUT_FILE is for efficient handling of large files.
 	# see comment on PUT_FILE above.
@@ -702,6 +737,7 @@ while (@uploadQueue) {
 	my $res = $ua->request($req);
 	print STDERR "\n";
 	if ($res->is_success) {
+	    $file->{upload} = 0;
 	    print $res->status_line, "\n";
 	    $res->headers->scan(sub { print "$_[0]: $_[1]\n"; }) if $verbose;
 	    print $res->content, "\n" if $verbose;
