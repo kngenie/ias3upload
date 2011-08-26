@@ -11,6 +11,7 @@ use URI::Escape;
 use Getopt::Long;
 use File::Spec;
 use IO::Handle;
+use Encode;
 
 use constant IAS3URLBASE => 'http://s3.us.archive.org';
 use constant IADLURLBASE => 'http://www.archive.org/download';
@@ -18,6 +19,9 @@ use constant ENV_AUTHKEYS => 'IAS3KEYS';
 use constant VERSION => '0.7.1';
 
 use constant UPLOADJOURNAL => 'ias3upload.jnl';
+
+my $inencoding = 'UTF-8';
+my $outencoding = 'UTF-8';
 
 sub resolvePath {
     my $rpath = shift;
@@ -29,6 +33,7 @@ sub resolvePath {
 }
 sub splitCSV {
     my $line = shift;
+    $line = decode($inencoding, $line);
     # chomp does not work well with CSV saved as "Windows CSV" on Mac.
     #chomp($line);
     $line =~ s/\s+$//;
@@ -304,14 +309,15 @@ sub metadataHeaders {
     if (ref $v eq 'ARRAY') {
 	if ($#{$v} == 0) {
 	    # if there's only one value, we don't use indexed form
-	    return ('x-archive-meta-' . $h, $v->[0]);
+	    return ('x-archive-meta-' . $h, encode($outencoding, $v->[0]));
 	} else {
 	    my $i = 1;
-	    return map((sprintf('x-archive-meta%02d-%s', $i++, $h), $_),
+	    return map((sprintf('x-archive-meta%02d-%s', $i++, $h),
+			encode($outencoding, $_)),
 		       @$v);
 	}
     } else {
-	return ('x-archive-meta-' . $h, $v);
+	return ('x-archive-meta-' . $h, encode($outencoding, $v));
     }
 }
 
@@ -684,8 +690,8 @@ while (@uploadQueue) {
 	# prepare actual HTTP headers for metadata
 	push(@headers, 'x-amz-auto-make-bucket', 1);
 	# As metadata (most often 'collection' and 'subject') may have multiple
-	# values, %metadata has an array for each metadata name (in come case,
-	# notably 'title', may be a scalar). If there in fact multiple values,
+	# values, %metadata has an array for each metadata name (in some cases,
+	# notably 'title', may be a scalar). If there in fact are multiple values,
 	# we use metadata header in indexed form. If there's only one value
 	# (either in an array or as a scalar), we use basic form. Special metadata
 	# 'collection' is also handled by this same logic.
