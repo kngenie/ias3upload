@@ -154,10 +154,11 @@ my %metadefaults;
 # behavior of IAS3. I made 'override-mode' default because it matches user's
 # expectation.)
 my $keepExistingMetadata = 0;
+my $noDerive = 0;
+my $forceMetadataUpdate = 0;
 # these control options are not implemented yet.
 my $keepOldVersion = 0;
 my $cascadeDelete = 0;
-my $noDerive = 0;
 
 my $homedir = $ENV{'HOME'};
 $homedir =~ s![^/]$!$&/!;	# ensure $homedir has trailing slash
@@ -330,7 +331,7 @@ sub lastFile {
 	$c++ if $f->{upload};
     }
     print STDERR "$c file(s) to upload in ", $item->{name}, "\n";
-    return $c <= 1;
+    return $c == 1;
 }
 
 # IAS3 auth keys are taken from three locations
@@ -370,11 +371,16 @@ GetOptions('n'=>\$dryrun,
 	   # control options
 	   'keep-existing-metadata'=>\$keepExistingMetadata,
 	   'no-derive'=>\$noDerive,
+	   'update-metadata'=>\$forceMetadataUpdate,
 	   # not yet supported control options
 	   'keep-old'=>\$keepOldVersion,
 	   'cascade-delete'=>\$cascadeDelete,
     );
-
+# check for incompatible option combinations
+if ($keepExistingMetadata && $forceMetadataUpdate) {
+    die "conflicting options: --update-metadata and ".
+	"--keep-existing-metadata";
+}
 if ($initConfig) {
     initConfig();
     exit(0);
@@ -653,8 +659,14 @@ foreach my $item (values %{$task->{items}}) {
 	$file->{upload} = 1;
 	push(@{$task->{files}}, $file);
     }
+    # if metadata update is requested, schedule a dummy file for items
+    # with zero files to upload.
+    if ($forceMetadataUpdate && !grep($_->{upload}, @{$item->{files}})) {
+	my $dummyfile = { filename=>'*_meta.xml', item=>$item };
+	push(@{$task->{files}}, $dummyfile);
+    }
 }
-	    
+    
 # then open journal file for writing (append mode).
 open(my $jnl, '>>', $journalFile) or
     die "cannot open a journal file: $journalFile:$!\n";
@@ -665,9 +677,15 @@ open(my $jnl, '>>', $journalFile) or
 my @uploadQueue = @{$task->{files}};
 while (@uploadQueue) {
     my $file = shift @uploadQueue;
-    my $uripath = "/" . $file->{item}{name} . "/" . $file->{filename};
-    warn "File: ", $file->{file}, " -> ", $uripath, "\n";
-	
+    my $uripath;
+    # file object without 'file' member instructs forced metadata update.
+    if (!(defined $file->{file})) {
+	$uripath = "/" . $file->{item}{name};
+	warn "Item: ", $uripath, "\n";
+    } else {
+	$uripath = "/" . $file->{item}{name} . "/" . $file->{filename};
+	warn "File: ", $file->{file}, " -> ", $uripath, "\n";
+    }
     my $waitUntil = $file->{waitUntil};
     if (defined $waitUntil) {
 	my $sec = $waitUntil - time();
@@ -720,7 +738,7 @@ while (@uploadQueue) {
 	push(@headers, 'x-archive-queue-derive', '0');
     }
     # Expect header
-    push(@headers, 'expect', '100-continue');
+    push(@headers, 'Expect', '100-continue');
 
     my $uri = IAS3URLBASE . $uripath;
     my $content = $file->{path};
@@ -750,7 +768,8 @@ while (@uploadQueue) {
 	    printf($jnl "U %s %s %s %s\n",
 		   uri_escape($file->{file}),
 		   $file->{mtime}, $file->{item}{name},
-		   uri_escape($file->{filename}));
+		   uri_escape($file->{filename}))
+		if $file->{file};
 	    print "\n";
 	} else {
 	    print $res->status_line, "\n", $res->content, "\n\n";
