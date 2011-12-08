@@ -1,0 +1,9 @@
+"item","file","mediatype","collection","title","creator","language","description","contributor","date","subject[0]","subject[1]","subject[2]","subject[3]"
+"${IDENTIFIER}","${FILENAME}","movies","your-collection-identifier","The Title of Your Item","Creators Name","eng","Description that appears on item page.","Contributors Name","YYYY-MM-DD","keyword 1","keyword 2",,
+,"${FILENAME}",,,,,,,,,,,,
+,"${FILENAME}",,,,,,,,,,,,
+"${IDENTIFIER}","${FILENAME}","movies","your-collection-identifier","The Title of Your Item","Creators Name","eng","Description that appears on item page.","Contributors Name","YYYY-MM-DD","keyword 1","keyword 2","keyword 3",
+"${IDENTIFIER}","${FILENAME}","audio","your-collection-identifier","The Title of Your Item","Creators Name","eng","Description that appears on item page.","Contributors Name","YYYY-MM-DD","Keyword 1",,,
+,"${FILENAME}",,,,,,,,,,,,
+,"${FILENAME}",,,,,,,,,,,,
+"${IDENTIFIER}","${FILENAME}","texts","your-collection-identifier","The Title of Your Item","Creators Name","eng","Description that appears on item page.","Contributors Name","YYYY-MM-DD","keyword 1","keyword 2","keyword 3","keyword 4"
