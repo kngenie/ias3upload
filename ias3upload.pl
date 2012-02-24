@@ -582,7 +582,7 @@ foreach my $cn (('item', 'file', 'mediatype')) {
     if (exists $colidx{$cn} && $#{$colidx{$cn}} > 0) {
 	die "ERROR:sorry, you can't have $cn in more than one column\n";
     }
-    $colidx{$cn} = $colidx{$cn}->[0];
+    $colidx{$cn} = $colidx{$cn}->[0] if exists $colidx{$cn};
 }
 
 my $curCollections = [];
@@ -611,7 +611,7 @@ while (<MT>) {
     # skip empty row
     next unless (grep(/\S/, @fields));
     my $collections = [];
-    if (exists $colidx{'collection'}) {
+    if (defined $colidx{'collection'}) {
 	my @collections = grep($_, @fields[@{$colidx{'collection'}}]);
 	$collections = \@collections;
     }
@@ -622,7 +622,7 @@ while (<MT>) {
 # 	die "ERROR:collection is unknown at $metatbl:$.";
 #     }
 
-    my $itemName = (exists $colidx{'item'}) && $fields[$colidx{'item'}]
+    my $itemName = (defined $colidx{'item'}) && $fields[$colidx{'item'}]
 	|| $curItem->{name};
     unless ($itemName) {
 	die "item identifier is unknown at $metatbl:$.\n";
@@ -830,7 +830,7 @@ while (@uploadQueue) {
             if $verbose;
 	    my $exmetadata = fetchMetadata($ua, $item->{name});
             unless ($exmetadata->{server}) {
-		print STDERR "item $item->{name} does not exist" if $verbose;
+		print STDERR "item $item->{name} does not exist\n" if $verbose;
 	    }
 	    # crucial metadata may be lost if we proceed without fetching metadata
 	    unless (defined $exmetadata) {
