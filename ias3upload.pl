@@ -39,19 +39,21 @@ sub splitCSV {
     $line =~ s/\s+$//;
     # following code handles quotes. we could use existing module
     # for doing this, but I wanted to keep this script 'stand-alone'.
-    my @pieces = split(/([,"])/, $line);
+    my @pieces = $line =~ /[,"]|[^,"]*/g;
     my @fields = ();
     my @v;
     while (@pieces) {
 	my $t = shift @pieces;
 	if ($t eq ',') {
 	    push(@fields, join('', @v));
-	    @v = ()
+	    @v = ();
 	} elsif ($t eq '"') {
-	    $t = shift @pieces;
-	    while (defined $t && $t ne '"') {
+	    while (defined ($t = shift @pieces)) {
+		if ($t eq '"') {
+		    last if !@pieces || $pieces[0] ne '"';
+		    $t = shift @pieces; # '"'
+		}
 		push(@v, $t);
-		$t = shift @pieces;
 	    }
 	} else {
 	    push(@v, $t);
