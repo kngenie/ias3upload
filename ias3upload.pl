@@ -12,11 +12,15 @@ use Getopt::Long;
 use File::Spec;
 use IO::Handle;
 use Encode;
+use English;
 
 use constant IAS3URLBASE => 'http://s3.us.archive.org';
 use constant IADLURLBASE => 'http://www.archive.org/download';
+use constant IAMETAURLBASE => 'http://www.archive.org/metadata';
+use constant META_XML => '_meta.xml';
+
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
-use constant VERSION => '0.7.2';
+use constant VERSION => '0.7.3';
 
 use constant UPLOADJOURNAL => 'ias3upload.jnl';
 
@@ -135,9 +139,89 @@ sub escapeText {
     $_[0];
 }
 
+# simple-minded JSON parser. note $_[0] is modified.
+sub parseJSON {
+    no strict 'vars';
+    local *json = \$_[0];
+    $json =~ s/^\s+//;
+    if ($json =~ s/^\{//) {
+	my %d;
+	unless ($json =~ s/^\s*}//) {
+	    while (1) {
+		# assumes no \-escape in keys
+		$json =~ s/^\s*\"([^"]*)\"\s*:// or die "JSON key syntax error: $json";
+		my $k = $1;
+		my $v = parseJSON($json);
+		$d{$k} = $v;
+		last if $json =~ s/^\s*\}//;
+		$json =~ s/^\s*,// or die "comma is expected: $json";
+	    }
+	}
+	return \%d;
+    } elsif ($json =~ s/^\s*\[//) {
+	my @a;
+	unless ($json =~ s/^\s*\]//) {
+	    while (1) {
+		my $v = parseJSON($json);
+		push(@a, $v);
+		last if $json =~ s/^\s*\]//;
+		$json =~ s/^\s*,// or die "comma is expected: $json";
+	    }
+	}
+	return \@a;
+    } elsif ($json =~ s/^\"//) {
+	my $v = "";
+	while (1) {
+	    $json =~ s/^[^\\"]*//;
+	    $v .= $&;
+	    if ($json =~ s/^\\u([0-9a-fA-F]{4})//) {
+		$v .= chr(hex($1));
+	    } elsif ($json =~ s/^\\x([0-9a-fA-F]{2})//) {
+		$v .= chr(hex($1));
+            } elsif ($json =~ s/^\\(.)//) {
+		if ($1 eq 't') { $v .= "\t"; }
+		else { $v .= $1; }
+	    } else {
+		$json =~ s/^"// or die "unterminated string at $json";
+		last;
+	    }
+	}
+	return $v;
+    } elsif ($json =~ s/^[+-]?(\d+(\.\d*)?|\.\d+)//) {
+	my $v = $&;
+	return $v;
+    } else {
+	die "JSON syntax error: $json";
+    }
+}
+sub fetchMetadata {
+    my $ua = shift;
+    my $itemname = shift;
+
+    # retrieve item metadata with new metadata API.
+    # API returns "{}" for non-existent item, rather than 404.
+    my $res = $ua->get(IAMETAURLBASE.'/'.$itemname);
+    if ($res->is_success) {
+	# TODO JSON parse error handling
+	my $json = $res->content;
+	#print STDERR "META:".$json."\n";
+	my $data = parseJSON($json);
+	my $meta = $data->{metadata};
+	if (defined $meta) {
+	    for my $k (('identifier')) {
+		delete $meta->{$k};
+	    }
+	}
+	return $meta;
+    } else {
+	return undef;
+    }
+}
+
 my $ias3keys;
 
 # controls
+my $help_and_exit = 0;
 my $initConfig = 0;
 # no actual upload
 my $dryrun = 0;
@@ -152,12 +236,20 @@ my $metatbl = 'metadata.csv';	# CSV file having metadata for each item
 # default metadata from command line
 my %metadefaults;
 
+# how metadata is applied to items:
+# 'keep': make no change to existing metadata.
+# 'update': keep existing metadata (if item exists), update those specified in
+#   metadata.csv.
+# 'replace': wipe out existing metadata and set what's specified in metadata.csv
+#   anew.
+my $metadataAction = 'update';
 # don't update metadata of existing items (in fact it is the default
 # behavior of IAS3. I made 'override-mode' default because it matches user's
 # expectation.)
-my $keepExistingMetadata = 0;
+#my $keepExistingMetadata = 0;
 my $noDerive = 0;
-my $forceMetadataUpdate = 0;
+#my $forceMetadataUpdate = 0;
+my $ignoreNofile = 0;
 # these control options are not implemented yet.
 my $keepOldVersion = 0;
 my $cascadeDelete = 0;
@@ -335,7 +427,11 @@ sub lastFile {
     print STDERR "$c file(s) to upload in ", $item->{name}, "\n";
     return $c == 1;
 }
-
+# test for metadata
+sub unspecified {
+    my $v = shift;
+    return !defined($v) || $v eq '' || ref $v eq 'ARRAY' && $#$v == -1;
+}
 # IAS3 auth keys are taken from three locations
 # (from lowest to highest priority):
 # 1) {access,secret}_key parameters in $HOME/.s3cfg
@@ -357,8 +453,9 @@ if (exists $ENV{ENV_AUTHKEYS()}) {
     }
 }
 
-GetOptions('n'=>\$dryrun,
-	   'v'=>\$verbose,
+GetOptions('h'=>\$help_and_exit,
+	   'n'=>\$dryrun,
+	   'v+'=>\$verbose,
 	   'f'=>\$forceupload,
 	   'm'=>\$checkstore,
 	   'l=s'=>\$metatbl,
@@ -371,18 +468,41 @@ GetOptions('n'=>\$dryrun,
 	   'dm=s'=>\$metadefaults{'mediatype'},
 	   'init'=>\$initConfig,
 	   # control options
-	   'keep-existing-metadata'=>\$keepExistingMetadata,
+	   'keep-metadata'=>sub { $metadataAction = 'keep'; },
+	   'replace-metadata'=>sub { $metadataAction = 'replace'; },
 	   'no-derive'=>\$noDerive,
-	   'update-metadata'=>\$forceMetadataUpdate,
+	   'ignore-nofile'=>\$ignoreNofile,
+	   #'update-metadata'=>\$forceMetadataUpdate,
 	   # not yet supported control options
 	   'keep-old'=>\$keepOldVersion,
 	   'cascade-delete'=>\$cascadeDelete,
     );
-# check for incompatible option combinations
-if ($keepExistingMetadata && $forceMetadataUpdate) {
-    die "conflicting options: --update-metadata and ".
-	"--keep-existing-metadata";
+if ($help_and_exit) {
+    print STDERR <<"EOH";
+$0 [OPTIONS]
+options:
+    -h \tshow this help message and exit.
+    -l METADATA.CSV use specified file as upload description 
+      \t\t(default ./metadata.csv)
+    -n\t\tsimulate upload process, but don't actually upload files.
+    -f\t\tupload all files ignoring upload history.
+    -m\t\tquery storage server to confirm the file being uploaded is
+      \t\tin fact a new file (can be slow).
+    -c COLLECTIONS\tdefault collection.
+    -i ITEMID\tdefault item name.
+    --keep-metadata\tkeep existing metadata (metadata ignored for existing items).
+    --replace-metadata\treplace entire metadata with what's given.
+    --no-derive\tdo not trigger derive.
+    --init\tcreate ~/.ias3cfg file by fetching credentials from IA web.
+    -v\t\tprint extra trace output.
+EOH
+    exit(0);
 }
+# check for incompatible option combinations
+#if ($keepExistingMetadata && $forceMetadataUpdate) {
+#    die "conflicting options: --update-metadata and ".
+#	"--keep-existing-metadata";
+#}
 if ($initConfig) {
     initConfig();
     exit(0);
@@ -405,17 +525,16 @@ unless ($ias3keys =~ /^[A-Za-z0-9]+:[A-Za-z0-9]+$/) {
 # process multi-valued metadata defaults
 foreach my $m (('collection')) {
     if (defined $metadefaults{$m}) {
-	my @values = split(/\s*,\s*/, $metadefaults{$m});
+	my @values = split(/\s*[,;]\s*/, $metadefaults{$m});
 	$metadefaults{$m} = \@values;
     }
 }
 
-# metatbl is kept open until the end of all uploads.
+# entire metatbl is read into memory before starting upload.
 unless (open(MT, $metatbl)) {
     die "cannot open $metatbl: $!\n";
 }
 my $task = {
-    collections => {},
     items => {},
     files => []
 };
@@ -448,18 +567,24 @@ foreach my $i (0..$#fieldnames) {
 # some must-have fields
 # "file" field must exist as a column - no command line default
 exists $colidx{'file'} or die "ERROR:required column 'file' is missing\n";
-# other metadata fields may be given in a column or in command line
-foreach my $cn (('item', 'creator', 'mediatype', 'collection')) {
+# "item" may be given in a column or in command line
+foreach my $cn (('item')) {
     unless (exists $colidx{$cn} || defined $metadefaults{$cn}) {
 	die "ERROR:'$cn' must either exist as a column, or be specified by option\n";
     }
 }
+# # other metadata fields may be given in a column or in command line
+# foreach my $cn (('item', 'creator', 'mediatype', 'collection')) {
+#     unless (exists $colidx{$cn} || defined $metadefaults{$cn}) {
+# 	die "ERROR:'$cn' must either exist as a column, or be specified by option\n";
+#     }
+# }
 # check for columns that can appear only once
 foreach my $cn (('item', 'file', 'mediatype')) {
     if (exists $colidx{$cn} && $#{$colidx{$cn}} > 0) {
 	die "ERROR:sorry, you can't have $cn in more than one column\n";
     }
-    $colidx{$cn} = $colidx{$cn}->[0];
+    $colidx{$cn} = $colidx{$cn}->[0] if exists $colidx{$cn};
 }
 
 my $curCollections = [];
@@ -472,12 +597,7 @@ my $curItem;
 # collections named in command-line become initial $curCollections
 if ($metadefaults{'collection'}) {
     # note $metadefaults{'collection'} is an array if defined
-    my @cols = map({ name => $metadefaults{'collection'},
-		     items => [] }, @{$metadefaults{'collection'}});
-    for my $col (@cols) {
-	$task->{collections}{$col->{name}} = $col;
-    }
-    $curCollections = \@cols;
+    $curCollections = $metadefaults{'collection'};
 }
 # similarly for $curItem
 if ($metadefaults{'item'}) {
@@ -492,19 +612,19 @@ while (<MT>) {
     my @fields = splitCSV($_);
     # skip empty row
     next unless (grep(/\S/, @fields));
-    my @collections;
-    if (exists $colidx{'collection'}) {
-	@collections = map {
-	    $task->{collections}{$_} ||= { name=>$_, items=>[] };
-	} grep($_, @fields[@{$colidx{'collection'}}]);
+    my $collections = [];
+    if (defined $colidx{'collection'}) {
+	my @collections = grep($_, @fields[@{$colidx{'collection'}}]);
+	$collections = \@collections;
     }
     # $curCollections carries over only when 'collection' columns are all empty
-    @collections or (@collections = @$curCollections);
-    unless (@collections) {
-	die "ERROR:collection is unknown at $metatbl:$.";
-    }
+    unless (@$collections) { $collections = $curCollections; }
+#     @$collections or (@collections = @$curCollections);
+#     unless (@collections) {
+# 	die "ERROR:collection is unknown at $metatbl:$.";
+#     }
 
-    my $itemName = (exists $colidx{'item'}) && $fields[$colidx{'item'}]
+    my $itemName = (defined $colidx{'item'}) && $fields[$colidx{'item'}]
 	|| $curItem->{name};
     unless ($itemName) {
 	die "item identifier is unknown at $metatbl:$.\n";
@@ -512,7 +632,8 @@ while (<MT>) {
     my $item = ($task->{items}{$itemName}
 		||= { name=>$itemName, metadata=>{}, files=>[] });
     
-    $item->{collections} = \@collections;
+    $item->{metadata}{collection} = $collections;
+    #$item->{collections} = \@collections;
 
     # allow for a row without "file" (i.e. empty), which just specifies
     # metadata for the item, no file to upload
@@ -577,7 +698,7 @@ while (<MT>) {
     $item->{'title'} ||= $item->{name};
 
     $curItem = $item;
-    $curCollections = \@collections;
+    $curCollections = $collections;
 
 }
 } # end of scope for $/
@@ -663,7 +784,7 @@ foreach my $item (values %{$task->{items}}) {
     }
     # if metadata update is requested, schedule a dummy file for items
     # with zero files to upload.
-    if ($forceMetadataUpdate && !grep($_->{upload}, @{$item->{files}})) {
+    if (!$ignoreNofile && !grep($_->{upload}, @{$item->{files}})) {
 	my $dummyfile = { filename=>'*_meta.xml', item=>$item };
 	push(@{$task->{files}}, $dummyfile);
     }
@@ -706,7 +827,37 @@ while (@uploadQueue) {
     # session) - it might exist on the server.
     unless ($item->{created}) {
 	my $metadata = $item->{metadata};
-
+	if ($metadataAction eq 'update') {
+            print STDERR "retrieving existing metadata for $item->{name}..."
+            if $verbose;
+	    my $exmetadata = fetchMetadata($ua, $item->{name});
+            unless ($exmetadata->{server}) {
+		print STDERR "item $item->{name} does not exist\n" if $verbose;
+	    }
+	    # crucial metadata may be lost if we proceed without fetching metadata
+	    unless (defined $exmetadata) {
+		warn "failed to get metadata of item $item->{name}\n";
+		$file->{waitUntil} = time() + 120;
+		push(@uploadQueue, $file);
+		next;
+	    }
+	    for my $k (keys %$exmetadata) {
+		if (unspecified($metadata->{$k})) {
+		    $metadata->{$k} = $exmetadata->{$k};
+		    print STDERR "existing metadata %k=".$exmetadata->{$k}
+		    if $verbose > 1;
+		}
+	    }
+	}
+	# check metadata
+	my @metaerrs = ();
+	for my $k (('creator', 'mediatype', 'collection')) {
+	    push(@metaerrs, $k) if unspecified($metadata->{$k});
+	}
+	if (@metaerrs) {
+	    die "ERROR:following mandatory metadata is undefined for item '"
+		.$item->{name}."':\n".join('', map("  $_\n", @metaerrs));
+	}
 	# prepare actual HTTP headers for metadata
 	push(@headers, 'x-amz-auto-make-bucket', 1);
 	# As metadata (most often 'collection' and 'subject') may have multiple
@@ -719,11 +870,11 @@ while (@uploadQueue) {
 	    push(@headers, metadataHeaders($h, $v));
 	}
 	# add metadata headers for collections item gets associated with
-	my @collectionNames = map($_->{name}, @{$item->{collections}});
-	push(@headers, metadataHeaders('collection', \@collectionNames));
+	#my @collectionNames = map($_->{name}, @{$item->{collections}});
+	#push(@headers, metadataHeaders('collection', \@collectionNames));
 
 	# overwrite existing bucket unless user explicitly told not to.
-	unless ($keepExistingMetadata) {
+	unless ($metadataAction eq 'keep') {
 	    push(@headers, 'x-archive-ignore-preexisting-bucket', '1');
 	}
 
