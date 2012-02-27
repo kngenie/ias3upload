@@ -20,7 +20,7 @@ use constant IAMETAURLBASE => 'http://www.archive.org/metadata';
 use constant META_XML => '_meta.xml';
 
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
-use constant VERSION => '0.7.3';
+use constant VERSION => '0.7.4';
 
 use constant UPLOADJOURNAL => 'ias3upload.jnl';
 
