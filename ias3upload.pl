@@ -20,7 +20,7 @@ use constant IAMETAURLBASE => 'http://www.archive.org/metadata';
 use constant META_XML => '_meta.xml';
 
 use constant ENV_AUTHKEYS => 'IAS3KEYS';
-use constant VERSION => '0.7.4';
+use constant VERSION => '0.7.5';
 
 use constant UPLOADJOURNAL => 'ias3upload.jnl';
 
@@ -190,6 +190,8 @@ sub parseJSON {
     } elsif ($json =~ s/^[+-]?(\d+(\.\d*)?|\.\d+)//) {
 	my $v = $&;
 	return $v;
+    } elsif ($json =~ s/^null//) {
+	return undef;
     } else {
 	die "JSON syntax error: $json";
     }
@@ -206,13 +208,12 @@ sub fetchMetadata {
 	my $json = $res->content;
 	#print STDERR "META:".$json."\n";
 	my $data = parseJSON($json);
-	my $meta = $data->{metadata};
-	if (defined $meta) {
-	    for my $k (('identifier')) {
-		delete $meta->{$k};
-	    }
+	unless (defined $data) {
+	    # item does not exist - this is not an error.
+	    return {server=>undef, dir=>undef,
+		    files=>undef, created=>undef, metadata=>{}};
 	}
-	return $meta;
+	return $data;
     } else {
 	return undef;
     }
@@ -683,7 +684,7 @@ while (<MT>) {
 	    next;
 	}
 	# these fields are special and already handled above
-	next if $fn =~ /^file|item|collection$/;
+	next if $fn =~ /^(file|item|collection)$/;
 	# other fields are plain metadata (X-Archive-Meta-* headers)
 	# note that index ([\d+] after column name) doesn't matter at all
 	# and multiple metadata are sent in the order they appear in a row
@@ -828,18 +829,22 @@ while (@uploadQueue) {
     unless ($item->{created}) {
 	my $metadata = $item->{metadata};
 	if ($metadataAction eq 'update') {
-            print STDERR "retrieving existing metadata for $item->{name}..."
+            print STDERR "retrieving existing metadata for $item->{name}...\n"
             if $verbose;
 	    my $exmetadata = fetchMetadata($ua, $item->{name});
-            unless ($exmetadata->{server}) {
-		print STDERR "item $item->{name} does not exist\n" if $verbose;
-	    }
 	    # crucial metadata may be lost if we proceed without fetching metadata
 	    unless (defined $exmetadata) {
 		warn "failed to get metadata of item $item->{name}\n";
 		$file->{waitUntil} = time() + 120;
 		push(@uploadQueue, $file);
 		next;
+	    }
+            unless ($exmetadata->{server}) {
+		print STDERR "item $item->{name} does not exist yet.\n" if $verbose;
+	    }
+	    $exmetadata = $exmetadata->{metadata};
+	    for my $k (('identifier')) {
+		delete $exmetadata->{$k};
 	    }
 	    for my $k (keys %$exmetadata) {
 		if (unspecified($metadata->{$k})) {
@@ -851,7 +856,7 @@ while (@uploadQueue) {
 	}
 	# check metadata
 	my @metaerrs = ();
-	for my $k (('creator', 'mediatype', 'collection')) {
+	for my $k (('mediatype', 'collection')) {
 	    push(@metaerrs, $k) if unspecified($metadata->{$k});
 	}
 	if (@metaerrs) {
