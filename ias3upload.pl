@@ -397,6 +397,19 @@ sub readConfig {
     }
 }
 
+sub encodeHeaderValue {
+    my $v = shift;
+    # replace vertical TAB(0x0b) with NL
+    $v =~ s/\x0b/\x0a/g;
+    # if value contains non-printable, use uri() encoding offered by IAS3
+    if ($v =~ /[\x00-\x1f]/) {
+	$v = encode($outencoding, $v);
+	$v =~ s/(\W)/'%'.unpack('H2',$1)/eg;
+	return 'uri('.$v.')';
+    } else {
+	return encode($outencoding, $v);
+    }
+}
 sub metadataHeaders {
     my ($h, $v) = @_;
     # Since RFC822 disallow '-' in header names, IAS3 translates
@@ -405,15 +418,15 @@ sub metadataHeaders {
     if (ref $v eq 'ARRAY') {
 	if ($#{$v} == 0) {
 	    # if there's only one value, we don't use indexed form
-	    return ('x-archive-meta-' . $h, encode($outencoding, $v->[0]));
+	    return ('x-archive-meta-' . $h, encodeHeaderValue($v->[0]));
 	} else {
 	    my $i = 1;
 	    return map((sprintf('x-archive-meta%02d-%s', $i++, $h),
-			encode($outencoding, $_)),
+			encodeHeaderValue($_)),
 		       @$v);
 	}
     } else {
-	return ('x-archive-meta-' . $h, encode($outencoding, $v));
+	return ('x-archive-meta-' . $h, encodeHeaderValue($v));
     }
 }
 
