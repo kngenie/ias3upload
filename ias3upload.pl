@@ -190,8 +190,10 @@ sub parseJSON {
     } elsif ($json =~ s/^[+-]?(\d+(\.\d*)?|\.\d+)//) {
 	my $v = $&;
 	return $v;
-    } elsif ($json =~ s/^null//) {
+    } elsif ($json =~ s/^(null|false)//) {
 	return undef;
+    } elsif ($json =~ s/^true//) {
+        return 1;
     } else {
 	die "JSON syntax error: $json";
     }
