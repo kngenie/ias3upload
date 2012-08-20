@@ -10,7 +10,7 @@ use HTTP::Date qw(str2time);
 use URI::Escape;
 use Getopt::Long;
 use File::Spec;
-use IO::Handle;
+use IO::File;
 use Encode;
 use English;
 
@@ -35,36 +35,64 @@ sub resolvePath {
     my $dir = File::Spec->catpath((File::Spec->splitpath($base))[0, 1]);
     return File::Spec->rel2abs($rpath, $dir);
 }
+sub readCSVRow {
+    my $fh = shift;
+    my $inquote = 0;
+    my @fields = ();
+    do {
+	my $pos = $fh->getpos();
+	defined (my $line = <$fh>) or return ();
+	# if $line has CR in the middle, it is very likely CSV is saved in
+	# Mac format (CR as newline). re read from $pos with EOL set to CR.
+	if ($line =~ /\r(?!\n)/) {
+	    $fh->setpos($pos) || die "ERROR:seek failed\n";
+	    $/ = "\r";
+	    $line = <$fh>;
+	}
+	my ($cols, $inquote2) = splitCSV($line, $inquote);
+	if ($inquote) {
+	    my $first = shift @{$cols};
+	    $fields[$#fields] .= " $first" if $first ne '';
+	}
+	push(@fields, @{$cols});
+	$inquote = $inquote2;
+    } until (!$inquote);
+    return @fields;
+}
+
 sub splitCSV {
     my $line = shift;
+    my $inquote = (shift || 0);
     $line = decode($inencoding, $line);
     # chomp does not work well with CSV saved as "Windows CSV" on Mac.
     #chomp($line);
     $line =~ s/\s+$//;
     # following code handles quotes. we could use existing module
     # for doing this, but I wanted to keep this script 'stand-alone'.
-    my @pieces = $line =~ /[,"]|[^,"]*/g;
     my @fields = ();
+    my $l = $line;
     my @v;
-    while (@pieces) {
-	my $t = shift @pieces;
-	if ($t eq ',') {
-	    push(@fields, join('', @v));
-	    @v = ();
-	} elsif ($t eq '"') {
-	    while (defined ($t = shift @pieces)) {
-		if ($t eq '"') {
-		    last if !@pieces || $pieces[0] ne '"';
-		    $t = shift @pieces; # '"'
-		}
-		push(@v, $t);
+    while ($l ne '') {
+	if ($l =~ s/^""//) {
+	    # escaped double-quote
+	    push(@v, '"');
+	} elsif ($l =~ s/^"//) {
+	    $inquote = !$inquote;
+	} elsif ($l =~ s/^,//) {
+	    if ($inquote) {
+		push(@v, ',');
+	    } else {
+		push(@fields, join('', @v));
+		@v = ();
 	    }
 	} else {
+	    my ($t) = $l =~ /^([^,"]*)/;
 	    push(@v, $t);
+	    $l = $POSTMATCH;
 	}
     }
     push(@fields, join('', @v));
-    return @fields;
+    return (\@fields, $inquote);
 }
 
 # obsoleted code that reads file content into a string of bytes.
@@ -547,7 +575,8 @@ foreach my $m (('collection')) {
 }
 
 # entire metatbl is read into memory before starting upload.
-unless (open(MT, $metatbl)) {
+my $mt = new IO::File;
+unless ($mt->open($metatbl)) {
     die "cannot open $metatbl: $!\n";
 }
 my $task = {
@@ -557,15 +586,7 @@ my $task = {
 # keep change to $/ local
 {
 local($/) = $/;    
-my $specline = <MT>;
-# if $specline has CR in the middle, it is very likely CSV is saved in
-# Mac format. start over with EOL set to CR.
-if ($specline =~ /\r(?!\n)/) {
-    seek(MT, 0, 0) || die "ERROR:seek on $metatbl failed\n";
-    $/ = "\r";
-    $specline = <MT>;
-}
-my @fieldnames = splitCSV($specline);
+my @fieldnames = readCSVRow($mt);
 my %colidx;
 foreach my $i (0..$#fieldnames) {
     print STDERR "Field[", $i + 1, "]:", $fieldnames[$i], "\n" if $verbose;
@@ -624,8 +645,7 @@ if ($metadefaults{'item'}) {
 }
 
 # read body rows
-while (<MT>) {
-    my @fields = splitCSV($_);
+while (my @fields = readCSVRow($mt)) {
     # skip empty row
     next unless (grep(/\S/, @fields));
     my $collections = [];
@@ -718,7 +738,7 @@ while (<MT>) {
 
 }
 } # end of scope for $/
-close(MT);
+$mt->close();
 
 # calculate total upload size for each item, for size-hint
 foreach my $item (values %{$task->{items}}) {
