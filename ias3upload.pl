@@ -975,9 +975,9 @@ while (@uploadQueue) {
 	    $res->headers->scan(sub { print "$_[0]: $_[1]\n"; }) if $verbose;
 	    print $res->content, "\n" if $verbose;
 	    printf($jnl "U %s %s %s %s\n",
-		   uri_escape($file->{file}),
+		   uri_escape_utf8($file->{file}),
 		   $file->{mtime}, $file->{item}{name},
-		   uri_escape($file->{filename}))
+		   uri_escape_utf8($file->{filename}))
 		if $file->{file};
 	    $jnl->flush();
 	    print "\n";
